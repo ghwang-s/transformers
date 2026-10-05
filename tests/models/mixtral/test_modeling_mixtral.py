@@ -16,6 +16,7 @@
 import unittest
 
 import pytest
+from parameterized import parameterized
 
 from transformers import is_torch_available, set_seed
 from transformers.testing_utils import (
@@ -36,6 +37,7 @@ if is_torch_available():
         MixtralForCausalLM,
         MixtralModel,
     )
+    from transformers.models.mixtral.modeling_mixtral import load_balancing_loss_func
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 
@@ -48,6 +50,28 @@ class MixtralModelTester(CausalLMModelTester):
 @require_torch
 class MixtralModelTest(CausalLMModelTest, unittest.TestCase):
     model_tester_class = MixtralModelTester
+
+    @parameterized.expand([("bool",), ("float32",), ("bfloat16",)])
+    def test_load_balancing_loss_4d_mask(self, mask_dtype):
+        set_seed(42)
+        segments = torch.tensor([[0, 1, 1, 2, 2, 0], [1, 1, 2, 2, 2, 0]], device=torch_device)
+        valid_tokens = segments.ne(0).reshape(-1)
+        gate_logits = tuple(torch.randn(12, 4, device=torch_device, requires_grad=True) for _ in range(2))
+        allowed = (segments[:, None, :, None] == segments[:, None, None, :]) & segments[:, None, None, :].ne(0)
+        allowed = allowed & torch.ones((6, 6), dtype=torch.bool, device=torch_device).tril()
+        attention_mask = allowed
+        if mask_dtype != "bool":
+            dtype = getattr(torch, mask_dtype)
+            attention_mask = torch.zeros_like(allowed, dtype=dtype).masked_fill(~allowed, torch.finfo(dtype).min)
+
+        loss = load_balancing_loss_func(gate_logits, 4, 2, attention_mask)
+        reference = load_balancing_loss_func(tuple(logits[valid_tokens] for logits in gate_logits), 4, 2)
+        torch.testing.assert_close(loss, reference)
+        gradients = torch.autograd.grad(loss, gate_logits, retain_graph=True)
+        reference_gradients = torch.autograd.grad(reference, gate_logits)
+        for grad, reference_grad in zip(gradients, reference_gradients):
+            torch.testing.assert_close(grad, reference_grad)
+            self.assertEqual(torch.count_nonzero(grad[~valid_tokens]).item(), 0)
 
     # TODO (ydshieh): Check this. See https://app.circleci.com/pipelines/github/huggingface/transformers/79245/workflows/9490ef58-79c2-410d-8f51-e3495156cf9c/jobs/1012146
     def is_pipeline_test_to_skip(

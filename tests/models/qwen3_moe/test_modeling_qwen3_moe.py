@@ -16,6 +16,7 @@
 import unittest
 
 import pytest
+from parameterized import parameterized
 
 from transformers import AutoTokenizer, BitsAndBytesConfig, is_torch_available, set_seed
 from transformers.testing_utils import (
@@ -38,6 +39,7 @@ if is_torch_available():
         Qwen3MoeForCausalLM,
         Qwen3MoeModel,
     )
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 
 
@@ -50,6 +52,44 @@ class Qwen3MoeModelTester(CausalLMModelTester):
 class Qwen3MoeModelTest(CausalLMModelTest, unittest.TestCase):
     test_all_params_have_gradient = False
     model_tester_class = Qwen3MoeModelTester
+
+    @parameterized.expand(
+        [
+            (backend, side, dtype)
+            for backend in ("eager", "sdpa")
+            for side in ("left", "right")
+            for dtype in ("float32", "bfloat16")
+        ]
+    )
+    def test_packed_load_balancing_loss(self, backend, padding_side, model_dtype):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        config.output_router_logits = True
+        config._attn_implementation = backend
+        dtype = getattr(torch, model_dtype)
+        model = Qwen3MoeForCausalLM(config).to(device=torch_device, dtype=dtype).eval()
+        input_ids = torch.tensor([[3, 4, 5, 6, 7, 8, 0, 0]], device=torch_device)
+        segments = torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]], device=torch_device)
+        if padding_side == "left":
+            input_ids = input_ids.roll(2, dims=1)
+            segments = segments.roll(2, dims=1)
+        allowed = (segments[:, None, :, None] == segments[:, None, None, :]) & segments[:, None, None, :].ne(0)
+        allowed = allowed & torch.ones((8, 8), dtype=torch.bool, device=torch_device).tril()
+        attention_mask = torch.zeros_like(allowed, dtype=dtype).masked_fill(~allowed, torch.finfo(dtype).min)
+        labels = input_ids.masked_fill(segments.eq(0), -100)
+
+        result = model(input_ids, attention_mask=attention_mask, labels=labels)
+        expected_aux_loss = load_balancing_loss_func(
+            result.router_logits, config.num_experts, config.num_experts_per_tok, segments.ne(0)
+        )
+        torch.testing.assert_close(result.aux_loss, expected_aux_loss)
+        result.loss.backward()
+        self.assertTrue(torch.isfinite(model.model.layers[0].mlp.gate.weight.grad).all())
+
+        # Changing one packed document must not affect the other document's logits.
+        changed_input_ids = input_ids.masked_fill(segments.eq(1), 9)
+        with torch.no_grad():
+            changed_result = model(changed_input_ids, attention_mask=attention_mask)
+        torch.testing.assert_close(result.logits[segments.eq(2)], changed_result.logits[segments.eq(2)])
 
     # TODO (ydshieh): Check this. See https://app.circleci.com/pipelines/github/huggingface/transformers/79245/workflows/9490ef58-79c2-410d-8f51-e3495156cf9c/jobs/1012146
     def is_pipeline_test_to_skip(

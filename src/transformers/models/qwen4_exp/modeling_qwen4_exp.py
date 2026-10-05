@@ -1538,8 +1538,8 @@ def load_balancing_loss_func(
             The number of experts to route per-token, can be also interpreted as the `top-k` routing
             parameter.
         attention_mask (`torch.Tensor`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
+            The attention mask used in the forward function: a 2D padding mask or a 4D causal mask
+            (boolean or additive). For a 4D mask, self-attention positions identify non-padding tokens.
 
     Returns:
         The auxiliary loss.
@@ -1555,6 +1555,12 @@ def load_balancing_loss_func(
     total_rows = 0.0
 
     if attention_mask is not None:
+        if attention_mask.ndim == 4:
+            # Preserve the structural mask in attention; the router loss only needs valid query tokens.
+            diagonal = attention_mask.diagonal(
+                offset=attention_mask.shape[-1] - attention_mask.shape[-2], dim1=-2, dim2=-1
+            )
+            attention_mask = (diagonal if diagonal.dtype == torch.bool else diagonal == 0).any(dim=1)
         # The same flat mask applies to every layer's [batch_size * sequence_length] rows.
         flat_mask = attention_mask.reshape(-1).to(device=compute_device, dtype=torch.float32)
 
